@@ -8,9 +8,7 @@
 class Calibrator {
     public:
         void begin() {
-            _hasAnchor = false;
             _stable = false;
-            _sum = 0;
             _count = 0;
         }
 
@@ -20,12 +18,11 @@ class Calibrator {
             }
 
             if (distanceCm == 0) {      // no echo, start over without an anchor
-                _hasAnchor = false;
+                _count = 0;
                 return;
             }
 
-            if (!_hasAnchor || !withinTolerance(distanceCm)) {
-                _hasAnchor = true;
+            if (_count == 0 || !withinTolerance(distanceCm)) {
                 _anchor = distanceCm;
                 _windowStartMs = now;
                 _sum = distanceCm;
@@ -53,10 +50,9 @@ class Calibrator {
             return diff <= Config::Calibration::stableToleranceCm;
         }
 
-        bool _hasAnchor = false;
         bool _stable = false;
         uint32_t _anchor = 0;
         uint32_t _windowStartMs = 0;
         uint32_t _sum = 0;
-        uint16_t _count = 0;
+        uint16_t _count = 0;            // 0 = no anchor yet
 };

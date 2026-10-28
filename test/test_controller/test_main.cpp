@@ -34,6 +34,14 @@ class FakeOutput : public ControllerOutput {
             rejectedReferenceCm = referenceCm;
         }
 
+        void baselineTooShort(uint32_t baselineCm) override {
+            tooShortCm = baselineCm;
+        }
+
+        void calibrationTimedOut() override {
+            timedOut = true;
+        }
+
         size_t count(uint16_t freqHz) {
             size_t n = 0;
             for (const Beep& b : beeps) n += b.freqHz == freqHz;
@@ -47,6 +55,8 @@ class FakeOutput : public ControllerOutput {
         bool lastAcceptedIsReference = false;
         uint32_t rejectedCm = 0;
         uint32_t rejectedReferenceCm = 0;
+        uint32_t tooShortCm = 0;
+        bool timedOut = false;
         int silences = 0;
 };
 
@@ -68,14 +78,19 @@ struct Sim {
         controller.update(in);
     }
 
+    // advances time by one step, then updates
+    void step(Controller::Inputs in) {
+        now += stepMs;
+        update(in);
+    }
+
     // one reading per step for durationMs
     void feed(uint32_t cm, uint32_t durationMs) {
+        Controller::Inputs in;
+        in.hasReading = true;
+        in.distanceCm = cm;
         for (uint32_t t = 0; t < durationMs; t += stepMs) {
-            now += stepMs;
-            Controller::Inputs in;
-            in.hasReading = true;
-            in.distanceCm = cm;
-            update(in);
+            step(in);
         }
     }
 
@@ -89,28 +104,20 @@ struct Sim {
 
     void wait(uint32_t durationMs) {
         for (uint32_t t = 0; t < durationMs; t += stepMs) {
-            now += stepMs;
-            update(Controller::Inputs());
+            step(Controller::Inputs());
         }
     }
 
-    void pressDown() {
+    // a single button event at the current time
+    void press(bool Controller::Inputs::*event) {
         Controller::Inputs in;
-        in.pressed = true;
+        in.*event = true;
         update(in);
     }
 
-    void shortPress() {
-        Controller::Inputs in;
-        in.shortPressed = true;
-        update(in);
-    }
-
-    void longPress() {
-        Controller::Inputs in;
-        in.longPressed = true;
-        update(in);
-    }
+    void pressDown()  { press(&Controller::Inputs::pressed); }
+    void shortPress() { press(&Controller::Inputs::shortPressed); }
+    void longPress()  { press(&Controller::Inputs::longPressed); }
 
     ControllerState state() {
         return controller.state();
@@ -123,7 +130,14 @@ struct Sim {
     }
 
     void alarmFromIdle() {
-        feed(controller.activeBaseline() - 30, 3 * stepMs);
+        feed(controller.activeBaseline() - 30, Config::Distance::confirmReadings * stepMs);
+    }
+
+    // calibrated at 100 cm, alarmed, stopped: now after-alarm calibrating
+    void stopAlarm() {
+        calibrateToIdle(100);
+        alarmFromIdle();
+        pressDown();
     }
 };
 
@@ -150,6 +164,7 @@ void test_long_press_calibrates_then_arms_after_delay() {
     Sim sim;
     sim.longPress();
     ASSERT_STATE(ControllerState::Calibrating, sim);
+    TEST_ASSERT_EQUAL(B::calibrateStartFreqHz, sim.out.beeps.back().freqHz);
 
     sim.feedPattern({100, 95, 105}, 5100);
     ASSERT_STATE(ControllerState::Calibrated, sim);
@@ -159,11 +174,12 @@ void test_long_press_calibrates_then_arms_after_delay() {
     TEST_ASSERT_EQUAL(B::confirmFreqHz, sim.out.beeps.back().freqHz);
     TEST_ASSERT_EQUAL(B::confirmMs, sim.out.beeps.back().durationMs);
 
-    sim.wait(4900);
+    const size_t beeps = sim.out.beeps.size();
+    sim.wait(Config::Timing::armDelayMs - 100);
     ASSERT_STATE(ControllerState::Calibrated, sim);
     sim.wait(200);
     ASSERT_STATE(ControllerState::Idle, sim);
-    TEST_ASSERT_EQUAL(B::armedFreqHz, sim.out.beeps.back().freqHz);
+    TEST_ASSERT_EQUAL(beeps, sim.out.beeps.size());     // arming is silent
 }
 
 void test_out_of_band_reading_restarts_window() {
@@ -190,13 +206,28 @@ void test_no_echo_restarts_window() {
     ASSERT_STATE(ControllerState::Calibrated, sim);
 }
 
-void test_calibrating_ticks_every_second_and_never_times_out() {
+void test_calibrating_is_silent_and_never_times_out() {
     Sim sim;
     sim.longPress();
+    const size_t before = sim.out.beeps.size();
     sim.feedPattern({50, 150}, 60000);
 
     ASSERT_STATE(ControllerState::Calibrating, sim);
-    TEST_ASSERT_EQUAL(60, sim.out.count(B::tickFreqHz));
+    TEST_ASSERT_EQUAL(before, sim.out.beeps.size());
+}
+
+void test_baseline_too_short_errors_and_keeps_calibrating() {
+    Sim sim;
+    sim.longPress();
+    sim.feed(10, 5200);
+    ASSERT_STATE(ControllerState::Calibrating, sim);
+    TEST_ASSERT_EQUAL(10, sim.out.tooShortCm);
+    TEST_ASSERT_EQUAL(1, sim.out.count(B::errorFreqHz));
+    TEST_ASSERT_EQUAL(0, sim.out.accepted.size());
+
+    sim.feed(100, 5200);
+    ASSERT_STATE(ControllerState::Calibrated, sim);
+    TEST_ASSERT_EQUAL(100, sim.out.accepted[0]);
 }
 
 void test_short_press_ignored_while_calibrating() {
@@ -240,7 +271,7 @@ void test_blocked_needs_three_readings_in_a_row() {
 
     sim.feed(80, 150);       // three readings
     ASSERT_STATE(ControllerState::Alarm, sim);
-    TEST_ASSERT_EQUAL(B::alarmFreqHz, sim.out.beeps.back().freqHz);
+    TEST_ASSERT_EQUAL(B::alarmMelody[0].freqHz, sim.out.beeps.back().freqHz);
 }
 
 void test_small_changes_and_no_echo_never_alarm() {
@@ -253,46 +284,62 @@ void test_small_changes_and_no_echo_never_alarm() {
     ASSERT_STATE(ControllerState::Idle, sim);
 }
 
-void test_alarm_beeps_every_10s_until_press() {
+void test_no_echo_between_blocked_readings_still_alarms() {
     Sim sim;
     sim.calibrateToIdle(100);
+    sim.feedPattern({80, 0}, 250);      // 80, 0, 80, 0, 80
+    ASSERT_STATE(ControllerState::Alarm, sim);
+}
+
+void test_alarm_plays_melody_on_repeat_until_press() {
+    Sim sim;
+    sim.calibrateToIdle(100);
+    const size_t before = sim.out.beeps.size();
     sim.alarmFromIdle();
     const uint32_t start = sim.now;
-    const size_t before = sim.out.count(B::alarmFreqHz);
 
-    sim.wait(25000);
-    TEST_ASSERT_EQUAL(before + 2, sim.out.count(B::alarmFreqHz));
-    TEST_ASSERT_EQUAL(start + 20000, sim.out.beeps.back().at);
+    uint32_t roundMs = 0;
+    std::vector<uint16_t> tune;
+    for (const B::Note& note : B::alarmMelody) {
+        roundMs += note.durationMs;
+        if (note.freqHz != 0) tune.push_back(note.freqHz);
+    }
+
+    sim.wait(2 * roundMs - 50);         // two full rounds
+    std::vector<uint16_t> played;
+    for (size_t i = before; i < sim.out.beeps.size(); i++) played.push_back(sim.out.beeps[i].freqHz);
+
+    TEST_ASSERT_EQUAL(2 * tune.size(), played.size());
+    for (size_t i = 0; i < played.size(); i++) {
+        TEST_ASSERT_EQUAL(tune[i % tune.size()], played[i]);
+    }
+    TEST_ASSERT_EQUAL(start + roundMs, sim.out.beeps[before + tune.size()].at);   // second round on time
 
     sim.pressDown();
-    ASSERT_STATE(ControllerState::Sleep, sim);
-    TEST_ASSERT_EQUAL(1, sim.out.silences);
-}
-
-void test_sleep_ignores_input_then_recalibrates() {
-    Sim sim;
-    sim.calibrateToIdle(100);
-    sim.alarmFromIdle();
-    sim.pressDown();
-    const size_t before = sim.out.beeps.size();
-
-    sim.shortPress();        // release of the stopping press
-    sim.longPress();
-    sim.feed(40, 29900);
-    ASSERT_STATE(ControllerState::Sleep, sim);
-    TEST_ASSERT_EQUAL(before, sim.out.beeps.size());
-
-    sim.wait(100);
     ASSERT_STATE(ControllerState::Calibrating, sim);
-    TEST_ASSERT_EQUAL(B::sleepEndFreqHz, sim.out.beeps.back().freqHz);
+    TEST_ASSERT_EQUAL(1, sim.out.silences);
+    TEST_ASSERT_EQUAL(B::calibrateStartFreqHz, sim.out.beeps.back().freqHz);
 }
 
-void test_post_sleep_still_blocked_goes_back_to_alarm() {
+void test_holding_the_stopping_press_does_not_replace_reference() {
     Sim sim;
-    sim.calibrateToIdle(100);
-    sim.alarmFromIdle();
-    sim.pressDown();
-    sim.wait(30000);
+    sim.stopAlarm();
+    sim.longPress();         // same press, still held for longPressMs
+    sim.feed(150, 5200);
+    TEST_ASSERT_FALSE(sim.out.lastAcceptedIsReference);
+    TEST_ASSERT_EQUAL(100, sim.controller.referenceBaseline());
+
+    sim.wait(Config::Timing::armDelayMs);
+    sim.pressDown();         // a new press can recalibrate again
+    sim.longPress();
+    sim.feed(150, 5200);
+    TEST_ASSERT_TRUE(sim.out.lastAcceptedIsReference);
+    TEST_ASSERT_EQUAL(150, sim.controller.referenceBaseline());
+}
+
+void test_after_alarm_still_blocked_goes_back_to_alarm() {
+    Sim sim;
+    sim.stopAlarm();
 
     sim.feed(70, 5200);
     ASSERT_STATE(ControllerState::Alarm, sim);
@@ -301,12 +348,9 @@ void test_post_sleep_still_blocked_goes_back_to_alarm() {
     TEST_ASSERT_EQUAL(100, sim.controller.activeBaseline());
 }
 
-void test_post_sleep_drift_accepted_without_moving_reference() {
+void test_after_alarm_drift_accepted_without_moving_reference() {
     Sim sim;
-    sim.calibrateToIdle(100);
-    sim.alarmFromIdle();
-    sim.pressDown();
-    sim.wait(30000);
+    sim.stopAlarm();
 
     sim.feed(95, 5200);
     ASSERT_STATE(ControllerState::Calibrated, sim);
@@ -318,12 +362,20 @@ void test_post_sleep_drift_accepted_without_moving_reference() {
     ASSERT_STATE(ControllerState::Idle, sim);
 }
 
+void test_after_alarm_calibration_that_never_settles_alarms() {
+    Sim sim;
+    sim.stopAlarm();
+    sim.feedPattern({50, 150}, Config::Calibration::afterAlarmTimeoutMs - 100);
+    ASSERT_STATE(ControllerState::Calibrating, sim);
+
+    sim.feedPattern({50, 150}, 200);
+    ASSERT_STATE(ControllerState::Alarm, sim);
+    TEST_ASSERT_TRUE(sim.out.timedOut);
+}
+
 void test_still_blocked_on_return_to_idle_alarms_again() {
     Sim sim;
-    sim.calibrateToIdle(100);
-    sim.alarmFromIdle();
-    sim.pressDown();
-    sim.wait(30000);
+    sim.stopAlarm();
     sim.feed(100, 5200);
     sim.wait(5000);
     ASSERT_STATE(ControllerState::Idle, sim);
@@ -352,16 +404,19 @@ int main() {
     RUN_TEST(test_long_press_calibrates_then_arms_after_delay);
     RUN_TEST(test_out_of_band_reading_restarts_window);
     RUN_TEST(test_no_echo_restarts_window);
-    RUN_TEST(test_calibrating_ticks_every_second_and_never_times_out);
+    RUN_TEST(test_calibrating_is_silent_and_never_times_out);
+    RUN_TEST(test_baseline_too_short_errors_and_keeps_calibrating);
     RUN_TEST(test_short_press_ignored_while_calibrating);
     RUN_TEST(test_long_press_restarts_calibration);
     RUN_TEST(test_button_ignored_during_arm_delay);
     RUN_TEST(test_blocked_needs_three_readings_in_a_row);
     RUN_TEST(test_small_changes_and_no_echo_never_alarm);
-    RUN_TEST(test_alarm_beeps_every_10s_until_press);
-    RUN_TEST(test_sleep_ignores_input_then_recalibrates);
-    RUN_TEST(test_post_sleep_still_blocked_goes_back_to_alarm);
-    RUN_TEST(test_post_sleep_drift_accepted_without_moving_reference);
+    RUN_TEST(test_no_echo_between_blocked_readings_still_alarms);
+    RUN_TEST(test_alarm_plays_melody_on_repeat_until_press);
+    RUN_TEST(test_holding_the_stopping_press_does_not_replace_reference);
+    RUN_TEST(test_after_alarm_still_blocked_goes_back_to_alarm);
+    RUN_TEST(test_after_alarm_drift_accepted_without_moving_reference);
+    RUN_TEST(test_after_alarm_calibration_that_never_settles_alarms);
     RUN_TEST(test_still_blocked_on_return_to_idle_alarms_again);
     RUN_TEST(test_long_press_in_idle_replaces_reference);
     return UNITY_END();

@@ -2,7 +2,6 @@
 
 #include <Arduino.h>
 #include "../IoMap.hpp"
-#include "../Config.hpp"
 
 class Buzzer {
     public:

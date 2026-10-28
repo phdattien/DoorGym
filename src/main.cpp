@@ -1,7 +1,6 @@
 // ultrasonic door alarm: button, HC-SR04 distance sensor and buzzer
 
 #include <Arduino.h>
-#include "pitches.h"
 #include "modules/button.hpp"
 #include "modules/distance.hpp"
 #include "modules/buzzer.hpp"
@@ -28,7 +27,6 @@ class HardwareOutput : public ControllerOutput {
                 case ControllerState::Calibrated:   Serial.println(F("calibrated, arming")); break;
                 case ControllerState::Idle:         Serial.println(F("idle")); break;
                 case ControllerState::Alarm:        Serial.println(F("ALARM")); break;
-                case ControllerState::Sleep:        Serial.println(F("sleep")); break;
             }
         }
 
@@ -39,11 +37,21 @@ class HardwareOutput : public ControllerOutput {
         }
 
         void baselineRejected(uint32_t baselineCm, uint32_t referenceCm) override {
-            Serial.print(F("still blocked after sleep: "));
+            Serial.print(F("still blocked after alarm: "));
             Serial.print(baselineCm);
             Serial.print(F(" cm, reference "));
             Serial.print(referenceCm);
             Serial.println(F(" cm"));
+        }
+
+        void baselineTooShort(uint32_t baselineCm) override {
+            Serial.print(F("baseline too short: "));
+            Serial.print(baselineCm);
+            Serial.println(F(" cm, recalibrating"));
+        }
+
+        void calibrationTimedOut() override {
+            Serial.println(F("never settled after alarm"));
         }
 
     private:
