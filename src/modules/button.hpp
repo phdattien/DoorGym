@@ -34,10 +34,22 @@ class Button {
                 _longReported = true;
                 _longPressEvent = true;
             }
+
+            _shortPressEvent = released() && !_longReported;
         }
 
+        // true once on the debounced press-down edge
         bool pressed() {
             return !_stable && _prevStable;
+        }
+
+        bool released() {
+            return _stable && !_prevStable;
+        }
+
+        // true once on release, only if the press was shorter than Config::Button::longPressMs
+        bool shortPressed() {
+            return _shortPressEvent;
         }
 
         // true once when the button has been held for Config::Button::longPressMs
@@ -59,6 +71,7 @@ class Button {
         uint32_t _pressStartMs = 0;
         bool _longReported = false;
         bool _longPressEvent = false;
+        bool _shortPressEvent = false;
 };
 
 

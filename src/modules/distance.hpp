@@ -26,38 +26,15 @@ class DistanceSensor {
             return distance;
         }
 
-        void setBaseline(uint32_t cm) {
-            _baseline = cm;
-        }
-
-        uint32_t getBaseline() {
-            return _baseline;
-        }
-
-        void update() {
+        // pings every Config::Distance::pingIntervalMs, true when a new reading was taken
+        bool update() {
             const uint32_t now = millis();
             if (now - _lastPingMs < Config::Distance::pingIntervalMs) {
-                return;
+                return false;
             }
             _lastPingMs = now;
-
-            const uint32_t distance = getDistance();
-            _lastDistance = distance;
-            const bool blocked = distance > 0 && distance + Config::Distance::marginCm < _baseline;
-
-            if (blocked == _blocked) {
-                _confirmCount = 0;
-                return;
-            }
-            if (++_confirmCount < Config::Distance::confirmReadings) {
-                return;
-            }
-            _confirmCount = 0;
-            _blocked = blocked;
-        }
-
-        bool isBlocked() {
-            return _blocked;
+            _lastDistance = getDistance();
+            return true;
         }
 
         uint32_t getLastDistance() {
@@ -65,11 +42,6 @@ class DistanceSensor {
         }
 
     private:
-        uint32_t _baseline = 0;                 // 0 = not calibrated, never triggers
-
-        bool _blocked = false;
-        uint8_t _confirmCount = 0;
         uint32_t _lastPingMs = 0;
         uint32_t _lastDistance = 0;
 };
-
